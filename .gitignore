@@ -1,0 +1,10 @@
+# 凭证文件：绝不入库
+credentials.txt
+*credentials*
+*.cred
+
+# 部署过程产物
+*.zip
+*.dgst
+xray
+config.json
