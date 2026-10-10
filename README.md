@@ -129,7 +129,7 @@ bash "$DOC/scripts/06-verify-client.sh" ./credentials.txt
 
 ### 步骤 1：体检 + swap + 关资源杀手
 
-做三件事：打印机器实况；内存 < 2GB 且 swap < 512MB 时自动建 swap 并写入 `fstab`；**mask 掉 apt 全套自动升级定时器**。内存 < 1GB 时额外停用云主机上无用的守护进程（`multipathd` 约 26MB、`tuned` 约 16MB 等，合计可回收约 60MB）。
+做三件事：打印机器实况；内存 < 2GB 且 swap < 512MB 时自动建 swap 并写入 `fstab`；**mask 掉 apt 全套自动升级定时器**；**mask 掉 `fwupd` 固件更新服务**（云主机用不上，却可单进程吃掉近 200MB，见附录 D）。内存 < 1GB 时额外停用云主机上无用的守护进程（`multipathd` 约 26MB、`tuned` 约 16MB 等，合计可回收约 60MB）。
 
 刻意**不碰**云厂商的管理代理（`AliYunDun`、`aliyun-service` 等）——关掉会影响控制台改密码、监控等功能，该不该关是机器主人的决定。
 
@@ -175,6 +175,14 @@ systemctl mask --now apt-daily.timer apt-daily-upgrade.timer \
   apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>&1 | grep -c Created | xargs -I{} echo "  已 mask {} 项"
 pkill -9 -f unattended-upgr 2>/dev/null
 pkill -9 -f apt-check 2>/dev/null
+echo
+
+# --- 掐掉 fwupd 固件更新服务：云主机无固件可更，却能单进程吃掉近 200MB ---
+# 它由 D-Bus 按需拉起，disable 无效，必须 mask。不区分内存大小一律执行。
+echo ">>> mask fwupd（2026-10-10 实测单进程 anon-rss 190MB，把 407MB 机器压到 OOM）"
+systemctl mask --now fwupd.service fwupd-refresh.service fwupd-refresh.timer 2>&1 \
+  | grep -c Created | xargs -I{} echo "  已 mask {} 项"
+pkill -9 -x fwupd 2>/dev/null
 echo
 
 # --- 关掉云主机上无用的守护进程（内存 < 1G 时执行）---
@@ -707,6 +715,7 @@ echo "  UDP: 通 $udp_ok / 失败 $udp_fail"
 |---|---|---|---|
 | TCP | `55620/55622` | 你的客户端出口 IP/32 | 端口数 = IP 数量，起始端口 `BASE_PORT` |
 | UDP | `55620/55622` | 同上 | **不加这条，UDP 代理静默失效** |
+| TCP | `22` | **你的运维出口 IP/32** | **不要对 0.0.0.0/0 开放**，否则会被持续爆破，见附录 D |
 
 ### 两个容易出错的点
 
@@ -720,6 +729,21 @@ echo "  UDP: 通 $udp_ok / 失败 $udp_fail"
 - **强烈建议填你的固定出口 IP/32**。公网暴露的 socks5 会在上线几分钟内被扫描器发现。
 - 出口 IP 不固定（家宽拨号）才用 `0.0.0.0/0`，此时依赖 16 位随机密码作为唯一防线。
 - 查自己的出口 IP：`curl https://api.ipify.org`
+
+### SSH 22 端口必须收窄
+
+阿里云新实例默认安全组常带一条 `22 ← 0.0.0.0/0`。2026-10-10 实测：上线 18 天的机器，
+**24 小时内 SSH 失败登录 29,981 次**。每次爆破都 fork 一个 sshd，在 512MB 机器上会
+和其他内存大户叠加，把整机压到假死（附录 D）。处理顺序：
+
+1. **安全组把 22 改成只放你的出口 IP/32**（最有效，零资源消耗）；
+2. 出口 IP 不固定时，至少在服务器上限速：
+   ```bash
+   iptables -I INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --set --name ssh
+   iptables -I INPUT 2 -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 6 --name ssh -j DROP
+   ```
+   （同一 IP 每分钟超过 6 次新连接即丢弃；不占内存，正常登录不受影响。重启失效，需持久化可装 `iptables-persistent`）
+3. 改用密钥登录并关闭密码登录（`PasswordAuthentication no`），**先确认密钥能登再关**。
 
 ### 不要"全部放通"
 
@@ -756,7 +780,16 @@ bash /root/sk5/02-install-xray.sh && systemctl restart xray
 # 资源占用
 systemctl show xray -p MemoryCurrent --value | awk '{print $1/1024/1024 " MB"}'
 cat /proc/loadavg
+
+# 「端口通但超时无响应」排障三连（附录 A / D 两次都是这个症状）
+journalctl -k --since "-1 day" --no-pager | grep -iE "out of memory|killed process"   # 谁被 OOM 杀了
+ps -eo rss,comm --sort=-rss | head -8                                                 # 内存大户
+journalctl -u ssh --since "-24h" --no-pager | grep -cE "Failed password|Invalid user" # SSH 爆破量
 ```
+
+> 主 IP 的 SSH 卡死时，**换一个辅助 IP 再试**。2026-10-10 那次主 IP 等 120 秒无 banner，
+> 换辅助 IP 第二次就进去了（同一台机器；可能是赶上内存短暂释放的窗口，也可能是 sshd
+> `MaxStartups` 随机丢弃没轮到，未进一步确认）。都进不去就用云控制台 VNC 或重启实例。
 
 ### 客户端使用
 
@@ -788,6 +821,7 @@ systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
 
 # 恢复被停用的守护进程
 systemctl enable --now multipathd.service tuned.service networkd-dispatcher.service
+systemctl unmask fwupd.service fwupd-refresh.service fwupd-refresh.timer
 
 # 移除 swap
 swapoff /swapfile && rm -f /swapfile
@@ -897,3 +931,46 @@ UDP 转发:      ✅ 正常（中继地址上报为公网 IP，DNS answer=2）
 环境: Ubuntu 24.04.2 / x86_64 / 407MB / Xray-core v26.3.27
 SHA256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae（与官方 .dgst 一致）
 ```
+
+---
+
+## 附录 D：2026-10-10 运行期事故复盘（上线第 18 天）
+
+### 现象
+
+客户端三路代理同时显示「超时无响应」。本机探测：三个 IP 都能 ping 通，
+三个代理端口和 SSH 22 都能完成 TCP 握手，但**应用层零响应**——SOCKS 握手不回包，
+SSH 等了 120 秒仍拿不到 banner。和附录 A 的症状完全一致。
+
+### 排查路径
+
+1. 主 IP 的 SSH 进不去 → **换辅助 IP 连同一台机器**，第二次就进去了。
+2. `uptime`：**load average 58.87 / 76.01 / 75.02**（2 核）；`free`：407MB 总内存，空闲 15MB，`kswapd0` 常驻。
+3. `vmstat` 的 `bi` 2500~3500：页缓存被反复挤出又读回 = 内存颠簸。
+4. 内核日志抓到真凶：
+
+```
+xray invoked oom-killer ...
+Out of memory: Killed process (fwupd) total-vm:667104kB, anon-rss:189876kB
+```
+
+5. 同时发现 SSH 正被爆破：**24 小时失败登录 29,981 次**，Top 来源单 IP 2,800+ 次；
+   密码登录开启、无 fail2ban、防火墙全放行。
+6. 入侵排查：7 天内成功登录仅来自运维自身 IP，无异常公钥，无挖矿进程，cron 干净。xray 已运行 17 天，RSS 仅 21MB，**代理本身无辜**。
+
+### 根因
+
+`fwupd`（Linux 固件更新守护进程，D-Bus 按需拉起）在云主机上无事可做，却占用约 190MB 匿名内存，
+接近总内存一半；叠加 SSH 爆破持续 fork sshd，把机器推进换页颠簸，全部用户态进程卡死。
+01 脚本当时只 mask 了 apt 系列，**漏掉了 fwupd**。
+
+### 处置与结果
+
+`systemctl mask --now fwupd fwupd-refresh fwupd-refresh.timer`，可用内存回到约 207MB；
+三路代理端到端验证全部恢复，出口 IP 正确。SSH 收窄见第 5 节。
+
+### 写进本文档的改进
+
+1. **`01-preflight.sh` 无条件 mask fwupd**（不分内存大小；它被 D-Bus 拉起，只 disable 无效）
+2. **安全组模板增加 22 端口条目，明确禁止对 0.0.0.0/0 开放**，并给出限速兜底方案
+3. **运维速查增加「端口通但无响应」排障三连**，以及「主 IP 进不去就换辅助 IP」的技巧

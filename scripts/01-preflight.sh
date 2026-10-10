@@ -40,6 +40,14 @@ pkill -9 -f unattended-upgr 2>/dev/null
 pkill -9 -f apt-check 2>/dev/null
 echo
 
+# --- 掐掉 fwupd 固件更新服务：云主机无固件可更，却能单进程吃掉近 200MB ---
+# 它由 D-Bus 按需拉起，disable 无效，必须 mask。不区分内存大小一律执行。
+echo ">>> mask fwupd（2026-10-10 实测单进程 anon-rss 190MB，把 407MB 机器压到 OOM）"
+systemctl mask --now fwupd.service fwupd-refresh.service fwupd-refresh.timer 2>&1 \
+  | grep -c Created | xargs -I{} echo "  已 mask {} 项"
+pkill -9 -x fwupd 2>/dev/null
+echo
+
 # --- 关掉云主机上无用的守护进程（内存 < 1G 时执行）---
 if [ "$MEM_MB" -lt 1024 ]; then
   echo ">>> 内存 < 1G，停用云主机上无用的守护进程"
